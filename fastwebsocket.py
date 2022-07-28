@@ -331,8 +331,8 @@ async def clan_websocket(websocket: WebSocket, token: str = Query(...), Authoriz
         await websocket.close()
 
 async def broadcast():
-    try:
-        while True:
+    while True:
+        try:
             clan_tags = await user_db.distinct("tracked_clans")
             rtime = time.time()
             global keys
@@ -557,8 +557,8 @@ async def broadcast():
                 results = await player_stats.bulk_write(changes)
                 #print(results.bulk_api_result)
                 print(f"Update db time: {time.time() - rtime}")
-    except Exception as e:
-        print(e)
+        except Exception as e:
+            print(e)
 
 def gen_raid_date():
     now = datetime.utcnow().replace(tzinfo=utc)
