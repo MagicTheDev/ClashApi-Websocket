@@ -337,6 +337,7 @@ async def broadcast():
             rtime = time.time()
             global keys
 
+            #CLAN EVENTS
             async def fetch(url, session, headers):
                 async with session.get(url, headers=headers) as response:
                     player_ = await response.read()
@@ -420,6 +421,75 @@ async def broadcast():
                 print(f"Missing Player Update db time: {time.time() - rtime}")
             rtime = time.time()
 
+            '''
+            # WAR EVENTS
+            async def fetch(url, session, headers):
+                async with session.get(url, headers=headers) as response:
+                    player_ = await response.read()
+                    return player_
+
+            tasks = []
+            connector = aiohttp.TCPConnector(limit=1000)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                for tag in clan_tags:
+                    headers = {"Authorization": f"Bearer {keys[0]}"}
+                    tag = tag.replace("#", "%23")
+                    url = f"https://api.clashofclans.com/v1/clans/{tag}/currentwar"
+                    keys = collections.deque(keys)
+                    keys.rotate(1)
+                    keys = list(keys)
+                    task = asyncio.ensure_future(fetch(url, session, headers))
+                    tasks.append(task)
+                responses = await asyncio.gather(*tasks)
+                await session.close()
+
+            print(f"\nWar Fetch Time: {time.time() - rtime}")
+            rtime = time.time()
+
+            CLAN_MEMBERS = []
+            for response in responses:
+                try:
+                    response = orjson.loads(response)
+                    tag = response["tag"]
+                except:
+                    continue
+
+                del response["clanPoints"]
+                del response["clanVersusPoints"]
+                for x in range(0, len(response["memberList"])):
+                    del response["memberList"][x]["expLevel"]
+                    try:
+                        del response["memberList"][x]["league"]
+                    except:
+                        pass
+                    del response["memberList"][x]["trophies"]
+                    del response["memberList"][x]["versusTrophies"]
+                    del response["memberList"][x]["clanRank"]
+                    del response["memberList"][x]["previousClanRank"]
+                    del response["memberList"][x]["donations"]
+                    del response["memberList"][x]["donationsReceived"]
+
+                CLAN_MEMBERS += [member["tag"] for member in response["memberList"]]
+                try:
+                    previous_response = CLAN_CACHE[tag]
+                except:
+                    previous_response = None
+                if str(previous_response) != str(response):
+                    CLAN_CACHE[tag] = response
+                    for ws in CLAN_CLIENTS:
+                        ws: fastapi.WebSocket
+                        json_data = {"Clan Event": {"old_clan": previous_response, "new_clan": response}}
+                        if previous_response is not None:
+                            await ws.send_json(json_data)
+
+            print(f"Send events for clan change: {time.time() - rtime}")
+            print("The size of the clan dictionary is {} bytes".format(sys.getsizeof(CLAN_CACHE)))
+
+
+            '''
+
+
+            #PLAYER EVENTS
             async def fetch(url, session, headers):
                 async with session.get(url, headers=headers) as response:
                     player_ = await response.read()
@@ -465,23 +535,30 @@ async def broadcast():
                     pass
 
                 if str(previous_response) != str(response):
-                    '''
                     from jsondiff import diff
+                    differences = None
                     if diff(response, previous_response) is not None:
-                        print(diff(response, previous_response))
-                    '''
+                        differences = diff(response, previous_response)
 
                     PLAYER_CACHE[tag] = response
                     for ws in PLAYER_CLIENTS:
-                        ws : fastapi.WebSocket
-                        json_data = {"Player Event" : {"old_player": previous_response, "new_player" : response}}
-                        if previous_response is not None:
-                            await ws.send_json(json_data)
+                        if differences is not None:
+                            for dif in differences:
+                                ws : fastapi.WebSocket
+                                if str(dif) == "achievements":
+                                    print(differences[dif])
+                                else:
+                                    json_data = {f"{dif}" : {differences[dif]}}
+                                    print(json_data)
+                                    if previous_response is not None:
+                                        await ws.send_json(json_data)
+
                     if previous_response is not None:
                         clan_tag = "Unknown"
                         league = "None"
                         try:
                             clan_tag = response["clan"]["tag"]
+                            del response["clan"]["badgeUrls"]
                         except:
                             pass
                         try:
