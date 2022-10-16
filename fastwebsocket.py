@@ -16,6 +16,7 @@ from json import loads as json_loads
 from datetime import datetime
 from datetime import timedelta
 from dotenv import load_dotenv
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import fastapi
 import motor.motor_asyncio
@@ -26,11 +27,12 @@ import asyncio
 import orjson
 import pytz
 import os
-import json
 import coc
 
 utc = pytz.utc
 load_dotenv()
+scheduler = AsyncIOScheduler(timezone=utc)
+scheduler.start()
 
 EMAIL_PW = os.getenv("EMAIL_PW")
 DB_LOGIN = os.getenv("DB_LOGIN")
@@ -43,6 +45,7 @@ user_db = new_looper.user_db
 player_stats = new_looper.player_stats
 leaderboard_db = new_looper.leaderboard_db
 war_stats = new_looper.war_stats
+persist = new_looper.persist
 
 usafam = db_client.usafam
 clan_db = usafam.clans
@@ -162,7 +165,6 @@ def create_keys():
             print(e)
 
 keys = create_keys()
-coc_client = coc.login("apiclashofclans+test12@gmail.com", EMAIL_PW, client=coc.EventsClient, key_count=10, key_names="test", throttle_limit = 30, cache_max_size=50000)
 
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI()
@@ -203,6 +205,11 @@ async def login(user: User, Authorize: AuthJWT = Depends()):
             raise HTTPException(status_code=401, detail="Bad username or password")
     access_token = Authorize.create_access_token(subject=user.username,fresh=True)
     return {"access_token": access_token}
+
+@app.get('/servers')
+async def server_():
+    servers = await db_client.usafam.server.distinct("server")
+    return {"servers": servers}
 
 @app.websocket("/players")
 async def player_websocket(websocket: WebSocket, token: str = Query(...), Authorize: AuthJWT = Depends()):
@@ -261,18 +268,14 @@ async def war_websocket(websocket: WebSocket, token: str = Query(...), Authorize
 
 async def broadcast():
 
+    start = True
     while True:
         try:
             rtime = time.time()
             clan_tags = await clan_db.distinct("tag")
-            coc_client.add_clan_updates(*clan_tags)
             global keys
             global PLAYER_CACHE
             global CLAN_CACHE
-
-            if PLAYER_CACHE is None:
-                fh = open("db.json", 'r')
-                PLAYER_CACHE = json.load(fh)
 
             #CLAN EVENTS
             async def fetch(url, session, headers):
@@ -394,6 +397,7 @@ async def broadcast():
             ws_tasks = []
             for response in responses:
                 response_start = time.time()
+                BEEN_ONLINE = False
                 KEPT_ACHIEVEMENTS = ["Gold Grab", "Elixir Escapade", "Games Champion", "Aggressive Capitalism", "Most Valuable Clanmate"]
                 try:
                     response = orjson.loads(response)
@@ -455,6 +459,7 @@ async def broadcast():
 
                         #OUTGOING DONO CHANGE
                         if response["donations"] != previous_response["donations"]:
+                            BEEN_ONLINE = True
                             previous_dono = previous_response["donations"]
                             if previous_dono > response["donations"]:
                                 previous_dono = 0
@@ -471,6 +476,7 @@ async def broadcast():
 
                         #CAPITAL GOLD DONO CHANGE
                         if response["achievements"][-1]["value"] != previous_response["achievements"][-1]["value"]:
+                            BEEN_ONLINE = True
                             diff = response["achievements"][-1]["value"] - previous_response["achievements"][-1]["value"]
                             changes.append(UpdateOne({"tag": tag}, {"$push": {f"capital_gold.{raid_date}.donate": diff}}, upsert=True))
                             for ws in pc_copy:
@@ -479,8 +485,10 @@ async def broadcast():
                                 json_data = {"type": "Most Valuable Clanmate", "old_player": previous_response,"new_player": response}
                                 task = asyncio.ensure_future(send_ws(ws=ws, json=json_data))
                                 ws_tasks.append(task)
+
                         # CAPITAL GOLD RAID CHANGE
                         if response["achievements"][-2]["value"] != previous_response["achievements"][-2]["value"]:
+                            BEEN_ONLINE = True
                             diff = response["achievements"][-2]["value"] - previous_response["achievements"][-2]["value"]
                             changes.append(UpdateOne({"tag": tag}, {"$push": {f"capital_gold.{raid_date}.raid": diff}}, upsert=True))
                             changes.append(UpdateOne({"tag": tag}, {"$set": {f"capital_gold.{raid_date}.raided_clan": clan_tag}}, upsert=True))
@@ -490,15 +498,21 @@ async def broadcast():
                                 json_data = {"type": "Aggressive Capitalism", "old_player": previous_response,"new_player": response}
                                 task = asyncio.ensure_future(send_ws(ws=ws, json=json_data))
                                 ws_tasks.append(task)
+
                         #CLAN GAME CHANGE
                         if response["achievements"][2]["value"] != previous_response["achievements"][2]["value"]:
+                            BEEN_ONLINE = True
                             diff = response["achievements"][2]["value"] - previous_response["achievements"][2]["value"]
                             changes.append(UpdateOne({"tag": tag}, {"$inc": {f"clan_games.{season}.points": diff}}, upsert=True))
                             changes.append(UpdateOne({"tag": tag}, {"$set": {f"clan_games.{season}.clan": clan_tag}}, upsert=True))
 
                         # NAME CHANGE
                         if response["name"] != previous_response["name"]:
+                            BEEN_ONLINE = True
                             changes.append(UpdateOne({"tag": tag}, {"$set": {"name": response["name"]}}))
+
+                        if response["trophies"] != previous_response["trophies"]:
+                            BEEN_ONLINE = True
 
                         #LEGENDS CHANGES
                         if response["trophies"] >= 4900 and league == "Legend League":
@@ -540,6 +554,11 @@ async def broadcast():
                                 for x in range(0, diff_defenses):
                                     changes.append(UpdateOne({"tag": tag}, {"$push": {f"legends.{legend_date}.defenses": 0}}, upsert=True))
 
+
+                        if BEEN_ONLINE:
+                            _time = int(datetime.now().timestamp())
+                            changes.append(UpdateOne({"tag": tag}, {"$set": {"last_online": _time}}))
+
             print(f"PLAYER RESPONSE DONE: {time.time() - rtime}")
 
             responses = await asyncio.gather(*ws_tasks, return_exceptions=False)
@@ -571,52 +590,10 @@ async def broadcast():
                 print(results.bulk_api_result)
                 print(f"NO NAME CHANGES: {time.time() - rtime}")
 
-            fh = open("db.json", 'w')
-            json.dump(PLAYER_CACHE, fh)
             print(f"DONE: {time.time() - rtime}")
         except Exception as e:
             print(e)
 
-
-@coc.WarEvents.state()
-async def war_state_change(old_war, new_war: coc.ClanWar):
-    async def send_ws(ws, json):
-        try:
-            await ws.send_json(json)
-        except:
-            try:
-                WAR_CLIENTS.remove(ws)
-            except:
-                pass
-    pc_copy = WAR_CLIENTS.copy()
-    ws_tasks = []
-    for ws in pc_copy:
-        ws: fastapi.WebSocket
-        json_data = {"type": "state", "state": str(new_war.state), "clan_tag": new_war.clan_tag}
-        task = asyncio.ensure_future(send_ws(ws=ws, json=json_data))
-        ws_tasks.append(task)
-    responses = await asyncio.gather(*ws_tasks, return_exceptions=False)
-
-@coc.WarEvents.war_attack()
-async def war_state_change(attack: coc.WarAttack, war: coc.ClanWar):
-    async def send_ws(ws, json):
-        try:
-            await ws.send_json(json)
-        except:
-            try:
-                WAR_CLIENTS.remove(ws)
-            except:
-                pass
-    pc_copy = WAR_CLIENTS.copy()
-    ws_tasks = []
-    for ws in pc_copy:
-        ws: fastapi.WebSocket
-        json_data = {"type": "attack", "clan_tag": war.clan_tag, "opponent_tag" : war.opponent.tag, "stars" : attack.stars, "destruction" : attack.destruction,
-                     "attacker_tag" : attack.attacker_tag, "attacker_name" : attack.attacker.name, "defender_tag" : attack.defender_tag, "defender_name" : attack.defender.name,
-                     "is_fresh" : attack.is_fresh_attack, "duration" : attack.duration}
-        task = asyncio.ensure_future(send_ws(ws=ws, json=json_data))
-        ws_tasks.append(task)
-    responses = await asyncio.gather(*ws_tasks, return_exceptions=False)
 
 def gen_raid_date():
     now = datetime.utcnow().replace(tzinfo=utc)
@@ -653,6 +630,7 @@ def gen_legend_date():
     else:
         date = now.date()
     return str(date)
+
 
 loop = asyncio.get_event_loop()
 config = Config(app=app, loop="asyncio", host = "104.251.216.53", port=8000,ws_ping_interval=120 ,ws_ping_timeout= 120)
